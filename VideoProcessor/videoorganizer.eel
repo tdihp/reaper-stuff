@@ -1,0 +1,393 @@
+// grid arrange all clips greedily
+
+/*
+NoIndex: true
+Description: grid arrange all clips greedily
+About: 
+  This is a video arrangement script that:
+    * split screen in to N x M configurable small blocks up to 16x16
+    * find largest n x m spot for each track with configurable restrictions
+    * search of next clip position is roughly done by Euclidean distance to
+      either "center" or left/top on corresponding dimension 
+    * Blurs the first encountered clip as background. (code copied from Reaper)
+Version: 0.1
+Author: tdihp
+*/
+
+/*
+Copyright (c) 2025 Ping He
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+//@param 1:debug "debug" 0 0 1 0.5 1
+// grid settings
+//@param 2:totalxblocks "totalXBlocks" 10 1 16 10 1
+//@param 3:totalyblocks "totalYBlocks" 6 1 16 10 1
+// must be smaller than MAX_BLOCK_DIM
+
+// switch prioritized growing direction, horizontal by default
+//@param 4:vfirst "hfirst/vfirst" 0 0 1 0.5 1
+//@param 5:cropratio "cropratio" 1.0 0.5 2.0 1.0 0.1
+//@param 6:presasp "nofill/stretch/preserve/crop"  2 -1 2 0 1
+//@param 7:maxclipbx "MaxClipBlockX" 16 1 16 10 1
+//@param 8:maxclipby "MaxClipBlockY" 16 1 16 10 1
+//@param 9:xcentered "x left/center" 1 0 1 0.5 1
+//@param10:ycentered "y  top/center" 1 0 1 0.5 1
+//@param11:atleast1blk "atleast1blkperclip" 0 0 1 0.5 1
+
+// Blur (low quality)
+//@param13:weight_parm 'blur amount' .5 0 .99 0.5 0.001
+//@param14:weight_mod 'Y modifier' 1 .8 1.2 1.0 0.001
+//@param15:want_l 'leftward' 1 0 1 .5 1
+//@param16:want_r 'rightward' 1 0 1 .5 1
+//@param17:want_u 'upward' 1 0 1 .5 1
+//@param18:want_d 'downward' 1 0 1 .5 1
+//@param19:force_rgb 'force RGB' 0 0 1 .5 1
+
+// -----------------------------------------------------------------------------
+// debug infra
+// -----------------------------------------------------------------------------
+
+dbgh = 20;
+dbgstart = dbgh;
+dbgx = dbgh;
+dbgy = dbgh;
+dbgfont="Noto Sans SC";
+dbgtext = #;
+function log(s)
+(
+  debug?(
+    gfx_set(1,1,1,1,1);
+    gfx_setfont(dbgh,dbgfont);
+    gfx_str_draw(s, dbgx, dbgy);
+    dbgy += dbgh;
+  );
+);
+
+// gfx_set(0);
+// gfx_fillrect(0,0,project_w,project_h);
+
+// -----------------------------------------------------------------------------
+// memory management
+// -----------------------------------------------------------------------------
+_memhead = 0;
+function malloc(n) local (oldhead) (
+  oldhead = _memhead;
+  _memhead += n;
+  oldhead;
+);
+
+// -----------------------------------------------------------------------------
+// blur background
+// -----------------------------------------------------------------------------
+
+force_rgb ? colorspace='RGBA';
+
+function bd(flag) (
+  weight= min(weight_parm*((flag&8) ? weight_mod : 1/weight_mod),1) ^.25;
+  weight2 = sqr(weight);
+  rowsize = ((flag&8) ? project_h : project_w);
+  rowsize -= 1 + (colorspace=='YV12' ? rowsize*.5);
+  gfx_evalrect(0,0,project_w,project_h,colorspace=='RGBA' ? "
+    (_1 -= 1) < 0 ? ( _1=rowsize; _2=r; _3=g; _4=b; );
+    r+=weight*(_2-r); _2=r; g+=weight*(_3-g); _3=g; b+=weight*(_4-b); _4=b;
+  " : "
+    (_1 -= 1) < 0 ? ( _1=rowsize; _2=y1; _3=y3; _4=u; _5=v; );
+    y1+=weight*(_2-y1); _2=(y2+=weight*(y1-y2));
+    y3+=weight*(_3-y3); _3=(y4+=weight*(y3-y4));
+    _4=(u+=weight2*(_4-u));
+    _5=(v+=weight2*(_5-v));
+  ",flag);
+);
+
+// -----------------------------------------------------------------------------
+// blit helper for crop
+// -----------------------------------------------------------------------------
+function crop_n_blit(input, x, y, w, h)
+    local (input_w, input_h, new_input_w, new_input_h) (
+  // crop  with aspect ratio, then blit the biggest possible center without bleeding
+  input_info(input, input_w, input_h);
+  // for the crop option, we find center and spread with calculated aspect ratio
+  new_input_w = floor(input_h * w / h);
+  (new_input_w > input_w)? (
+    // cut height
+    new_input_w = input_w;
+    new_input_h = floor(input_w * h / w);
+    input_x = 0;
+    input_y = floor((input_h - new_input_h) / 2);
+  ) : (
+    // cut width
+    new_input_h = input_h;
+    input_x = floor((input_w - new_input_w) / 2);
+    input_y = 0;
+  );
+  gfx_blit(input, 0, x, y, w, h, input_x, input_y, new_input_w, new_input_h);
+);
+
+
+
+// -----------------------------------------------------------------------------
+// walk through grid with given asciivis coded coordinates
+// -----------------------------------------------------------------------------
+MAX_BLOCK_DIM=16;
+gridwalk_16="OOPONOOPONPPPNNPNNQOMOOQOMQPQNMPMNPQPMNQNMQQQMMQMMROLOOROLRPRNLPLNPRPLNRNLRQRMLQLMQRQLMRMLSOKOOSOKSPSNKPKNPSPKNSNKRRRLLRLLSQSMKQKMQSQKMSMKTOJOSRSLKRKLRSRKLSLKOTOJTPTNJPJNPTPJNTNJTQTMJQJMQTQJMTMJSSSKKSKKTRTLJRJLRTRJLTLJUOIOOUOIUPUNIPINPUPINUNIUQUMIQIMQUQIMUMITSTKJSJKSTSJKTKJURULIRILRURILULIVOHOOVOHVPVNHPHNTTTJJTJJPVPHNVNHUSUKISIKSUSIKUKIVQVMHQHMQVQHMVMHVRVLHRHLRVRHLVLHUTUJITIJTUTIJUJIWOGOOWOGWPWNGPGNVSVKHSHKSVSHKVKHPWPGNWNGWQWMGQGMQWQGMWMGUUUIIUIIWRWLGRGLRWRGLWLGVTVJHTHJTVTHJVJHWSWKGSGKSWSGKWKGXOOXXPXNPXNXXQXMVUVIHUHIUVUHIVIHQXMXWTWJGTGJTWTGJWJGXRXLRXLXXSXKSXKXVVVHHVHHYOWUWIGUGIUWUGIWIGOYYPYNPYNYYQYMQYMYXTXJTXJXYRYLRYLYWVWHGVGHVWVGHWHGYSYKSYKYXUXIUXIXZOOZZPZNPZNZZQZMYTYJTYJYQZMZWWWGGWGGZRZLXVXHVXHXRZLZYUYIUYIYZSZKSZKZ[OO[[P[NXWXGWXGXP[N[ZTZJTZJZ[Q[MQ[M[YVYHVYHY[R[LR[L[ZUZIUZIZ[S[KS[K[XXYWYGWYGY\\O[T[JT[J[O\\\\P\\NZVZHVZHZP\\N\\\\Q\\MQ\\M\\\\R\\LR\\L\\[U[IU[I[YXXY\\S\\KZWZGWZGZS\\K\\[V[HV[H[\\T\\JT\\J\\]OO]]P]NP]N]]Q]MYYQ]M]ZXXZ]R]L\\U\\IU\\I\\R]L][W[GW[G[]S]KS]K]\\V\\HV\\H\\]T]JZYYZT]J]^O[XX[O^^P^NP^N^^Q^MQ^M^]U]IU]I]\\W\\GW\\G\\^R^LR^L^^S^KS^K^ZZ[YY[]V]HV]H]^T^J\\XX\\T^J^]W]GW]G]^U^IU^I^[ZZ[\\YY\\^V^HV^H^]XX][[^W^GW^G^\\ZZ\\]YY]^XX^\\[[\\]ZZ]^YY^\\\\][[]^ZZ^]\\\\]^[[^]]^\\\\^^]]^^^";
+gridwalk_16_strlen=1152;
+function asciivisdec(v) (v - 79); // 'O' is 0
+
+function gridwalk.init(minx, maxx, miny, maxy) local (maxabsx, maxabsy) (
+
+  // XXX: swap for greedy y direction
+  this.i = 0;
+  this.minx = minx;
+  this.maxx = maxx;
+  this.miny = miny;
+  this.maxy = maxy;
+  maxabsx = max(abs(minx), abs(maxx));
+  maxabsy = max(abs(miny), abs(maxy));
+  this.maxdist = maxabsx * maxabsx + maxabsy * maxabsy;
+  this.nx = 0;
+  this.ny = 0;
+);
+
+function gridwalk.next() local (found) (
+  found = 0;
+  while (
+      !found
+      && (this.i < gridwalk_16_strlen)
+      && ((this.nx * this.nx + this.ny * this.ny) <= this.maxdist) // early termination
+    ) (
+      (vfirst > 0)? (
+        this.ny = asciivisdec(str_getchar(gridwalk_16, this.i));
+        this.i += 1;
+        this.nx = asciivisdec(str_getchar(gridwalk_16, this.i));
+        this.i += 1;
+      ) : (
+        this.nx = asciivisdec(str_getchar(gridwalk_16, this.i));
+        this.i += 1;
+        this.ny = asciivisdec(str_getchar(gridwalk_16, this.i));
+        this.i += 1;
+      );
+
+      ((this.nx >= this.minx) && (this.nx <= this.maxx) && (this.ny >= this.miny) && (this.ny <= this.maxy)) ? (
+        found = 1;
+        this.x = this.nx;
+        this.y = this.ny;
+      )
+  );
+  found;
+);
+
+// -----------------------------------------------------------------------------
+// grid manager
+// -----------------------------------------------------------------------------
+MAX_CLIPS = 16;
+block_w = project_w / totalxblocks;
+block_h = project_h / totalyblocks;
+// dim walker, walk (w, h) pair with current grid size small to large
+function bdimwalk.init(w, h) (
+  log(sprintf(dbgtext, "bdimwalk.init(w %d, h %d)", w, h));
+  this.i = 0;
+  this.w_factor = w / block_w;
+  this.h_factor = h / block_h;
+  this.bwmax = min(
+    floor(this.w_factor * cropratio),
+    min(maxclipbx, totalXBlocks));
+  this.bhmax = min(
+    floor(this.h_factor * cropratio),
+    min(maxclipby, totalYBlocks));
+  log(sprintf(dbgtext, "%f, %f, %d, %d", this.w_factor, this.h_factor, this.bwmax, this.bhmax));
+);
+
+function bdimwalk._next() local (bw_float, bh_float)(
+  (this.w_factor > this.h_factor) ? (
+    this.bh = this.i;
+    bw_float = this.bh * this.w_factor / this.h_factor;
+    this.bw = floor(bw_float);
+    ((bw_float - this.bw) > 0.5) ? ((this.bw < this.bwmax) ? (this.bw += 1;););
+  ) : (
+    this.bw = this.i;
+    bh_float = this.bw * this.h_factor / this.w_factor;
+    this.bh = floor(bh_float);
+    ((bh_float - this.bh) > 0.5) ? ((this.bh < this.bhmax) ? (this.bh += 1;););
+  );
+  log(sprintf(dbgtext, "(this.bw %d <= this.bwmax %d) && (this.bh %d <= this.bhmax %d);", this.bw, this.bwmax, this.bh, this.bhmax));
+  (this.bw <= this.bwmax) && (this.bh <= this.bhmax);
+);
+
+function bdimwalk.next() local (found) (
+  (this.i == 0)? (
+    // we always emit 1,1 first.
+    this.bw = 1;
+    this.bh = 1;
+    found = 1;
+  ) : (
+    found = this..bdimwalk._next();
+    (found && this.i == 1 && this.bw == 1 && this.bh == 1)? (
+      this.i += 1;
+      found = this..bdimwalk._next();
+    );
+  );
+  found ? (this.i += 1;);
+  found;
+);
+
+function gm._update_dims(v, iw, ih, bw, bh) local (i) (
+  i = v * 4;
+  this.a_clip_dims[i] = iw; i += 1;
+  this.a_clip_dims[i] = ih; i += 1;
+  this.a_clip_dims[i] = bw; i += 1;
+  this.a_clip_dims[i] = bh;
+);
+
+function gm._blockcommit(v, iw, ih, bw, bh) local(i, j) (
+  j = ih;
+  while (j < (ih + bh)) (
+    i = iw;
+    while (i < (iw + bw)) (
+      this.a_blockspace[i + j * MAX_BLOCK_DIM] = v;
+      i += 1;
+    );
+    j += 1;
+  );
+);
+
+function gm.init() local (i) (
+  this.a_clip_dims = malloc(MAX_CLIPS * 4);
+  this.a_blockspace = malloc(MAX_BLOCK_DIM * MAX_BLOCK_DIM);
+  this..gm._blockcommit(-1, 0, 0, totalXBlocks, totalYBlocks);
+  i = 0; while(i < MAX_CLIPS) (this..gm._update_dims(i, -1, -1, -1, -1); i+=1;);
+);
+
+function gm._commit_dims(v) local (i) (
+  i = v * 4;
+  this..gm._blockcommit(v, this.a_clip_dims[i], this.a_clip_dims[i+1], this.a_clip_dims[i+2], a_clip_dims[i+3]);
+);
+
+// with given dimention, search the grid to find the first fit
+function gm._blocksearch(w, h) 
+    local(cx, cy, nx, ny, gridwalk, found, exhausted, check, i, j) (
+  xcentered? (cx = floor((totalxblocks - w) / 2)) : (cx = 0;);
+  ycentered? (cy = floor((totalyblocks - h) / 2)) : (cy = 0;);
+  gridwalk.init(-cx, totalxblocks - cx - 1, -cy, totalyblocks - cy - 1);
+  found = 0;
+  exhausted = 0;
+  while (!exhausted && !found) (
+    gridwalk.next()? (
+      nx = gridwalk.x + cx;
+      ny = gridwalk.y + cy;
+      check = 1;
+      j = ny;
+      while (j < (ny + h) && check) (
+        i = nx;
+        while (i < (nx + w) && check) (
+          check = (this.a_blockspace[i + j * MAX_BLOCK_DIM] < 0);
+          //(!check) ? (log(sprintf(dbgtext, "check %d, %d: %d", i, j, check)););
+          i += 1;
+        );
+        j += 1;
+      );
+      check? (
+        found = 1;
+        this.x = nx;
+        this.y = ny;
+      );
+    ) : (exhausted = 1);
+  );
+  found;
+);
+
+// main function to place a index with w, h into the grid with greedily large
+// block size
+function gm.place_index(index, w, h, maxblks) local (found, commit) (
+  this.bdimwalk.init(w, h);
+  commit = 0;
+  while(
+    found = 0;
+    this.bdimwalk.next() ? (
+      log("this.bdimwalk.next() ?");
+      (!maxblks || ((this.bdimwalk.bw * this.bdimwalk.bh) <= maxblks))? (
+        found = this..gm._blocksearch(this.bdimwalk.bw, this.bdimwalk.bh);
+        found? (
+          commit = 1;
+          this..gm._update_dims(index, this.x, this.y, this.bdimwalk.bw, this.bdimwalk.bh);
+        );
+      ) 
+    );
+    found; // we stop if no more hits, and commit the remembered one
+  );
+  commit? (
+    this..gm._commit_dims(index);
+  );
+  commit;
+);
+
+// lookup placed index, returns array of bx, by, bw, bh
+function gm.index_dims(index) (
+  this.a_clip_dims[index * 4];
+);
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+
+// we draw a blurred first clip as background
+crop_n_blit(input_track(0), 0, 0, project_w, project_h);
+(weight_parm>.00001) ? (
+  want_l ? bd(4); 
+  want_d ? bd(8);
+  want_u ? bd(4|8);
+  want_r ? bd(0);
+);
+
+ntracks = min(min(input_track_count(), MAX_CLIPS), totalxblocks * totalyblocks);
+gm.init();
+i = 0;
+remaining = totalxblocks * totalyblocks;
+while (
+  input=input_track(i);
+  found = 0;
+  input_info(input, w, h)? (
+    maxblks = 0;
+    atleast1blk? (
+      maxblks = remaining - (ntracks - i - 1);
+    );
+    found = gm.place_index(i, w, h, maxblks);
+    found? (
+      log("found");
+      a = gm.a_clip_dims + i * 4;
+      x = floor(a[0] * block_w);
+      y = floor(a[1] * block_h);
+      w = floor(a[2] * block_w);
+      h = floor(a[3] * block_h);
+      remaining -= a[2] * a[3];
+      log(sprintf(dbgtext, "found: bx: %d by: %d bw: %d bh %d", a[0], a[1], a[2], a[3]));
+      gfx_set(1,1,1,1,0);
+      (presasp < 2) ? (
+            gfx_blit(input, presasp, x, y, w, h);
+        ) : (
+            crop_n_blit(input, x, y, w, h);
+      );
+    );
+  );
+  // input_get_name(input, inputname);
+  log(sprintf(dbgtext, "track: %d (%s), input: %d, w: %d, h: %d", i, inputname, input, w, h));
+  i += 1;
+  found && (i < ntracks);
+);
