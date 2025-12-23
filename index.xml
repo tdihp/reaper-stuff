@@ -1,3 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="tdihp's Reaper Stuff">
-</index>
+<index version="1" name="tdihp's Reaper Stuff" commit="7cce46d41ef0ee69fa861c2820cc14a1698e5f1a">
+<category name="Distortion"><reapack name="repeatclipper.jsfx" type="effect" desc="RepeatClipper"><metadata><description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 This fx takes the idea of clipper to a different direction, instead of keeping a flat line, this fx repeat or mirror the signal back to its dynamic range, making unpleasant distortive waveform out of the original as soon as it crosses threshold.\par}
+}
+]]></description></metadata><version name="0.1" author="tdihp" time="2025-12-23T09:22:20Z"><source>https://github.com/tdihp/reaper-stuff/raw/c70775839d479773ee781112f8e8da09067ec701/Distortion/repeatclipper.jsfx</source></version></reapack></category><metadata><description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel0 \b \fs36 tdihp's Reaper Stuff\par}
+}
+]]></description></metadata></index>
